@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Thought Collapse",
+    "description": "Automatically collapses reasoning and tool calls in the conversation so the transcript stays clean."
+  }
+}
