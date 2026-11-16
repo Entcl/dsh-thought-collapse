@@ -4,8 +4,6 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
-    /** Locale namespace owned by this package. */
-    const NS = 'thoughtCollapse';
     /** Turn-tail list slot: replaceRisk "none", so a fresh id only adds an entry. */
     const SLOT = 'conversation.chat.turnTail';
     /** Stable contribution id, so a re-activation replaces instead of duplicating. */
@@ -14,67 +12,45 @@ window.__ModuleLoader__.load({
     const ORDER = 100;
 
     /**
-     * Shipped row roots: the reasoning row carries data-variant="think", every tool
-     * row carries data-tool. Both wrap a primitives DisclosureRow whose own root
-     * carries data-open only while expanded, so "is this folded" needs no private
-     * state of ours: we read and drive the shipped disclosure instead.
+     * Shipped DOM contracts this contribution reads and drives.
+     *
+     * All three are attributes the shipped chat client really renders:
+     *
+     * - `[data-chat-flow]` is the conversation column that holds every flow item of
+     *   one Session. It is the fold scope, so two Sessions open side by side never
+     *   fold each other's Turn 3.
+     * - `button[data-turn-process]` is the settled-Turn capsule ("已完成，用时 6 分 2 秒").
+     *   It carries `data-open` while unfolded and is `disabled` when the shipped
+     *   policy refuses to fold it.
+     * - `button[data-process-activity]` is the step-group header ("已修改 2 文件").
+     *   It carries `aria-expanded`, and its body holds the tool rows.
+     * - `[data-variant="think"]` is the reasoning row root; its inner primitives
+     *   DisclosureRow carries `data-open` while unfolded.
+     *
+     * Nothing here is re-implemented. The plugin only clicks the shipped toggles, so
+     * the animation, the aria state and the visual language stay the shipped ones.
      */
-    const OWNER_SELECTOR = '[data-variant="think"], [data-tool]';
-    const ROW_SELECTOR = '[data-disclosure-row]';
-    const OPEN_SELECTOR = '[data-open]';
+    const FLOW_SELECTOR = '[data-chat-flow]';
     const TURN_SELECTOR = '[data-chat-turn]';
+    const CAPSULE_SELECTOR = 'button[data-turn-process]';
+    const GROUP_SELECTOR = 'button[data-process-activity]';
+    const REASON_SELECTOR = '[data-variant="think"]';
 
     /**
-     * Turns already folded once, keyed by Session plus Turn number, so two Sessions
-     * that both have a Turn 3 never collide, and a remount cannot re-fold a Turn the
-     * user has since unfolded on purpose. Bounded, because the bar outlives any one
-     * Turn and an unbounded Set would grow with the whole conversation.
+     * A Turn counts as "just finished" only inside this window after its end time.
+     *
+     * The turn-tail Slot renders for every closed Turn in the transcript, including
+     * the ones restored from history when a Session opens. Folding those would
+     * override a disclosure state the user chose earlier, so a Turn whose end is
+     * older than this window is left exactly as the user left it.
      */
-    const AUTO_FOLDED = new Set();
-    const AUTO_FOLDED_LIMIT = 512;
+    const FRESH_MS = 10000;
 
-    /** Stable fold-guard key for one Turn; the Turn number alone is not unique. */
-    function autoFoldKey(sessionId, turnNumber) {
-      return String(sessionId === undefined || sessionId === null ? '' : sessionId) + '#' + turnNumber;
-    }
+    /** Fold passes, spread over the few frames the shipped render needs to settle. */
+    const PASS_DELAYS = [0, 60, 180, 420];
 
-    const DICTS = {
-      en: {
-        'bar.title': 'Analysis complete',
-        'bar.collapse': 'Fold reasoning and tool calls',
-        'bar.expand': 'Unfold reasoning and tool calls',
-        'bar.openCount': '{count} unfolded',
-        'bar.collapsed': 'Folded',
-        'bar.empty': 'Nothing to fold',
-      },
-      zh: {
-        'bar.title': '已完成分析',
-        'bar.collapse': '收起思考与工具调用',
-        'bar.expand': '展开思考与工具调用',
-        'bar.openCount': '已展开 {count} 项',
-        'bar.collapsed': '已收起',
-        'bar.empty': '暂无可折叠内容',
-      },
-    };
-
-    const CSS = [
-      '.dtc-anchor{display:none}',
-      '.dtc-bar{display:flex;align-items:center;margin-top:4px}',
-      '.dtc-toggle{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;',
-      'border:1px solid var(--dsw-alias-border-l1);border-radius:999px;',
-      'background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);',
-      'font:inherit;font-size:12px;line-height:18px;cursor:pointer;',
-      'transition:background-color .15s ease,color .15s ease,border-color .15s ease}',
-      '.dtc-toggle:hover:not([disabled]){background:var(--dsw-alias-bg-layer-2);',
-      'color:var(--dsw-alias-label-primary)}',
-      '.dtc-toggle:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);',
-      'outline-offset:2px}',
-      '.dtc-toggle[disabled]{cursor:default;opacity:.55}',
-      '.dtc-title{font-weight:500;color:var(--dsw-alias-label-primary)}',
-      '.dtc-meta{color:var(--dsw-alias-label-secondary);opacity:.8}',
-      '.dtc-chevron{flex:none;transition:transform .15s ease}',
-      '.dtc-bar[data-open] .dtc-chevron{transform:rotate(180deg)}',
-    ].join('');
+    /** The anchor only exists to hold a DOM ref, so it must never paint. */
+    const CSS = '.dtc-anchor{display:none}';
 
     /** Style element tag, so a second activation cannot stack a duplicate sheet. */
     const STYLE_TAG = 'thought-collapse';
@@ -104,321 +80,253 @@ window.__ModuleLoader__.load({
       };
     }
 
-    /** Locale seat with a built-in fallback, so a missing locale face still renders. */
-    function makeTranslate(seat) {
-      return function translate(key, params) {
-        if (typeof seat === 'function') {
-          try {
-            const value = seat(key, params);
-            if (typeof value === 'string' && value !== '' && value !== key) return value;
-          } catch (error) {
-            /* a locale face that throws must not take the row down */
-          }
-        }
-        const fallback = DICTS.zh[key];
-        return typeof fallback === 'string' ? fallback : key;
-      };
-    }
-
-    /** Fill the count placeholder ourselves; either locale behavior then reads right. */
-    function formatCount(t, count) {
-      return String(t('bar.openCount')).replace('{count}', String(count));
-    }
-
     /** Turn numbers are integers; anything else is not a usable selector value. */
     function isTurnNumber(value) {
       return typeof value === 'string' && /^[0-9]+$/.test(value);
     }
 
-    /** Our own wrapper carries the Turn number, so the fold needs no owner props. */
+    /**
+     * The Turn number of the flow item this anchor lives in.
+     *
+     * It is read from `[data-chat-turn]` — the same attribute `collectItems` later
+     * queries — so the scope and the items it searches always agree on one number.
+     * `[data-turn-tail]` is the shipped Turn-footer wrapper one level in and carries
+     * the same number, so it is only a fallback for a shape that moved it.
+     */
     function readTurnNumber(node) {
       try {
         if (node === null || node === undefined || typeof node.closest !== 'function') return null;
+        const item = node.closest(TURN_SELECTOR);
+        const value = item === null ? null : item.getAttribute('data-chat-turn');
+        if (isTurnNumber(value)) return value;
         const wrapper = node.closest('[data-turn-tail]');
         if (wrapper === null) return null;
-        const value = wrapper.getAttribute('data-turn-tail');
-        return isTurnNumber(value) ? value : null;
+        const fallback = wrapper.getAttribute('data-turn-tail');
+        return isTurnNumber(fallback) ? fallback : null;
       } catch (error) {
         return null;
       }
     }
 
     /**
-     * Every reasoning and tool-call disclosure belonging to one Turn, deduplicated.
-     * Several nested elements can carry data-chat-turn, so collecting owners into a
-     * Set keeps the counters from double-counting the same row. The search is scoped
-     * to the surrounding Turn list rather than the whole document: two Sessions
-     * rendered side by side both have a Turn 3, and only ours may be folded.
+     * The per-Session conversation column that holds this Turn's sibling nodes.
+     *
+     * Every chat node is its own `[data-chat-turn]` flow item, so the Turn's capsule
+     * and its step group are siblings of our own wrapper, not descendants of it.
+     * `closest` walks upward, so it lands on the column and never on the step-group
+     * body that happens to reuse the same attribute. When it cannot be resolved the
+     * caller skips the fold instead of scanning the document, because two Sessions
+     * side by side both have a Turn 3.
+     *
+     * The shipped group body also carries `data-chat-flow`, so the *outermost* match
+     * is taken: that is always the Session column, and it keeps the capsule in scope
+     * even when the footer itself renders inside a step group.
      */
-    function collectOwners(turnNumber, scope) {
-      if (!isTurnNumber(turnNumber)) return [];
-      const owners = new Set();
+    function resolveScope(start) {
+      try {
+        if (start === null || start === undefined || typeof start.closest !== 'function') return null;
+        const nearest = start.closest(FLOW_SELECTOR);
+        if (nearest === null) return null;
+        let scope = nearest;
+        for (let node = nearest.parentNode; node !== null && node !== undefined;) {
+          if (typeof node.matches === 'function' && node.matches(FLOW_SELECTOR)) scope = node;
+          node = node.parentNode;
+        }
+        return scope;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    /** Every flow item of one Turn inside one Session, deduplicated. */
+    function collectItems(turnNumber, scope) {
+      if (!isTurnNumber(turnNumber) || scope === null || scope === undefined) return [];
+      const items = new Set();
       let roots;
       try {
-        roots = (scope === null || scope === undefined ? document : scope)
-          .querySelectorAll(TURN_SELECTOR + '[data-chat-turn="' + turnNumber + '"]');
+        roots = scope.querySelectorAll(TURN_SELECTOR + '[data-chat-turn="' + turnNumber + '"]');
       } catch (error) {
         return [];
       }
-      for (let index = 0; index < roots.length; index += 1) {
-        let found;
+      for (let index = 0; index < roots.length; index += 1) items.add(roots[index]);
+      return Array.from(items);
+    }
+
+    /** The items of one Turn that match one of the shipped control selectors. */
+    function collectBy(selector, turnNumber, scope) {
+      const items = collectItems(turnNumber, scope);
+      const found = new Set();
+      for (let index = 0; index < items.length; index += 1) {
+        let matches;
         try {
-          found = roots[index].querySelectorAll(OWNER_SELECTOR);
+          matches = items[index].querySelectorAll(selector);
         } catch (error) {
           continue;
         }
-        for (let cursor = 0; cursor < found.length; cursor += 1) owners.add(found[cursor]);
+        for (let cursor = 0; cursor < matches.length; cursor += 1) found.add(matches[cursor]);
       }
-      return Array.from(owners);
+      return Array.from(found);
     }
 
-    /** The disclosure row inside one owner, when the owner renders one at all. */
-    function rowOf(owner) {
-      try {
-        return owner.querySelector(ROW_SELECTOR);
-      } catch (error) {
-        return null;
-      }
+    /** The shipped settled-Turn capsule of one Turn, when the policy renders one. */
+    function collectCapsules(turnNumber, scope) {
+      return collectBy(CAPSULE_SELECTOR, turnNumber, scope);
     }
 
-    /** A row is unfolded when its DisclosureRow root carries data-open. */
-    function isOpen(owner) {
-      try {
-        return owner.querySelector(OPEN_SELECTOR) !== null;
-      } catch (error) {
-        return false;
-      }
+    /** The step-group headers of one Turn. */
+    function collectGroups(turnNumber, scope) {
+      return collectBy(GROUP_SELECTOR, turnNumber, scope);
+    }
+
+    /** The reasoning rows of one Turn. */
+    function collectReasons(turnNumber, scope) {
+      return collectBy(REASON_SELECTOR, turnNumber, scope);
     }
 
     /**
-     * A row can be unfolded when DisclosureRow reports an expandable row, or when it
-     * rendered a dedicated leading toggle button (the no-row-click variant).
-     */
-    function isExpandable(row) {
-      if (row === null) return false;
-      if (row.hasAttribute('data-expandable')) return true;
-      try {
-        return row.querySelector('button[aria-expanded]') !== null;
-      } catch (error) {
-        return false;
-      }
-    }
-
-    /** Click whatever actually carries the disclosure toggle for one row. */
-    function clickRow(row) {
-      try {
-        if (row.getAttribute('role') === 'button') {
-          row.click();
-          return;
-        }
-        const leading = row.querySelector('button[aria-expanded]');
-        if (leading !== null) leading.click();
-      } catch (error) {
-        /* a detached or disabled row is simply skipped */
-      }
-    }
-
-    /** Nearest ancestor that holds several Turns, so one observer sees them all. */
-    function findTurnList(start) {
-      let node = start;
-      for (let depth = 0; depth < 8 && node !== null && node !== undefined; depth += 1) {
-        try {
-          if (node.querySelectorAll(TURN_SELECTOR).length > 1) return node;
-        } catch (error) {
-          return null;
-        }
-        node = node.parentElement;
-      }
-      return null;
-    }
-
-    /** Chevron pointing down: folding hides detail. */
-    function chevron() {
-      return h(
-        'svg',
-        {
-          className: 'dtc-chevron',
-          viewBox: '0 0 16 16',
-          width: 12,
-          height: 12,
-          'aria-hidden': true,
-        },
-        h('path', {
-          d: 'M4 6.5 8 10.5 12 6.5',
-          fill: 'none',
-          stroke: 'currentColor',
-          strokeWidth: 1.5,
-          strokeLinecap: 'round',
-          strokeLinejoin: 'round',
-        }),
-      );
-    }
-
-    /**
-     * Per-Turn control over the conversation's reasoning and tool-call rows.
+     * Fold the shipped settled-Turn capsule, which hides the whole step process.
      *
-     * Shipped rows already start folded and own their own disclosure state, which
-     * this contribution never duplicates: it reads that state off the DOM and drives
-     * it through the rows' own toggle, so the shipped animation and accessibility
-     * stay intact. What it adds is Turn-level control — one click folds the whole
-     * Turn again, and a finished Turn folds itself once.
+     * The button is `disabled` when the shipped policy will not fold it — verbose
+     * mode, a still-open Turn, or an aborted/errored one — and a disabled button
+     * ignores the click, so it is skipped rather than forced.
      */
-    function ThoughtCollapseBar(props) {
-      const seat = props ? props.t : undefined;
-      const t = React.useMemo(() => makeTranslate(seat), [seat]);
-      const anchorRef = React.useRef(null);
-      const [view, setView] = React.useState({ open: 0, total: 0 });
-      const stateRef = React.useRef({ open: 0 });
-
-      const turn = props ? props.turn : null;
-      const sessionId = props ? props.sessionId : undefined;
-      const status = turn !== null && typeof turn === 'object' && typeof turn.status === 'string'
-        ? turn.status
-        : 'unknown';
-      const closed = status === 'closed';
-
-      /** The Turn list this bar lives in; the fold must not reach other Sessions. */
-      const scope = React.useCallback(() => findTurnList(anchorRef.current), []);
-
-      /** Recompute the counters from the live Turn DOM. */
-      const read = React.useCallback(() => {
-        const owners = collectOwners(readTurnNumber(anchorRef.current), scope());
-        let open = 0;
-        for (let index = 0; index < owners.length; index += 1) {
-          if (isOpen(owners[index])) open += 1;
-        }
-        stateRef.current.open = open;
-        const total = owners.length;
-        setView((previous) => (
-          previous.open === open && previous.total === total ? previous : { open: open, total: total }
-        ));
-      }, [scope]);
-
-      /** Fold or unfold every reasoning and tool-call row of this Turn. */
-      const apply = React.useCallback((mode) => {
-        const turnNumber = readTurnNumber(anchorRef.current);
-        if (turnNumber === null) return;
-        const owners = collectOwners(turnNumber, scope());
-        const targets = [];
-        for (let index = 0; index < owners.length; index += 1) {
-          const owner = owners[index];
-          const open = isOpen(owner);
-          if (mode === 'expand' ? open : !open) continue;
-          const row = rowOf(owner);
-          if (row === null) continue;
-          if (!isExpandable(row)) continue;
-          targets.push(row);
-        }
-        for (let index = 0; index < targets.length; index += 1) clickRow(targets[index]);
-        stateRef.current.open = mode === 'expand' ? owners.length : 0;
-        setView((previous) => ({
-          open: mode === 'expand' ? Math.max(previous.total, owners.length) : 0,
-          total: Math.max(previous.total, owners.length),
-        }));
-        if (typeof window !== 'undefined' && typeof window.setTimeout === 'function') {
-          window.setTimeout(read, 0);
-        }
-      }, [read, scope]);
-
-      const toggle = React.useCallback(() => {
-        apply(stateRef.current.open > 0 ? 'collapse' : 'expand');
-      }, [apply]);
-
-      /* Keep the counters honest without owning any of the rows' state. */
-      React.useEffect(() => {
-        read();
-        if (typeof MutationObserver !== 'function') return undefined;
-        const anchor = anchorRef.current;
-        if (anchor === null) return undefined;
-        const container = findTurnList(anchor);
-        if (container === null) return undefined;
-        let frame = 0;
-        const observer = new MutationObserver(() => {
-          if (frame !== 0) return;
-          frame = window.requestAnimationFrame(() => {
-            frame = 0;
-            read();
-          });
-        });
+    function foldCapsules(turnNumber, scope) {
+      const capsules = collectCapsules(turnNumber, scope);
+      for (let index = 0; index < capsules.length; index += 1) {
+        const capsule = capsules[index];
+        if (capsule.disabled === true) continue;
+        if (!capsule.hasAttribute('data-open')) continue;
         try {
-          observer.observe(container, {
-            subtree: true,
-            childList: true,
-            attributes: true,
-            attributeFilter: ['data-open', 'data-expanded', 'data-chat-turn'],
-          });
+          capsule.click();
         } catch (error) {
+          /* a detached capsule is simply skipped */
+        }
+      }
+    }
+
+    /** Fold the step-group headers, which is what hides the tool rows. */
+    function foldGroups(turnNumber, scope) {
+      const groups = collectGroups(turnNumber, scope);
+      for (let index = 0; index < groups.length; index += 1) {
+        const group = groups[index];
+        if (group.getAttribute('aria-expanded') !== 'true') continue;
+        try {
+          group.click();
+        } catch (error) {
+          /* a detached header is simply skipped */
+        }
+      }
+    }
+
+    /**
+     * Fold the reasoning rows the user (or the live Turn) left unfolded.
+     *
+     * The primitives DisclosureRow reports its state as `data-open` on its own root,
+     * and toggles either from the row itself (`role="button"`) or from a dedicated
+     * leading button, so both shapes are handled.
+     */
+    function foldReasons(turnNumber, scope) {
+      const reasons = collectReasons(turnNumber, scope);
+      for (let index = 0; index < reasons.length; index += 1) {
+        const reason = reasons[index];
+        let row;
+        try {
+          row = reason.querySelector('[data-disclosure-row]');
+        } catch (error) {
+          continue;
+        }
+        if (row === null) continue;
+        let open;
+        try {
+          open = reason.querySelector('[data-open]') !== null;
+        } catch (error) {
+          continue;
+        }
+        if (!open) continue;
+        try {
+          if (row.getAttribute('role') === 'button') {
+            row.click();
+          } else {
+            const leading = row.querySelector('button[aria-expanded]');
+            if (leading !== null) leading.click();
+          }
+        } catch (error) {
+          /* a detached row is simply skipped */
+        }
+      }
+    }
+
+    /** One full fold pass over a Turn: capsule, then step groups, then reasoning. */
+    function foldTurn(turnNumber, scope) {
+      foldCapsules(turnNumber, scope);
+      foldGroups(turnNumber, scope);
+      foldReasons(turnNumber, scope);
+    }
+
+    /**
+     * Turn-end auto-fold.
+     *
+     * The contribution renders no chrome of its own: the shipped capsule already is
+     * the header the user asked for, so the plugin's whole job is to make sure a
+     * finished Turn really ends up folded, and to leave every pixel of the folded
+     * state to the shipped components.
+     *
+     * The turn-tail Slot only exists once a Turn has ended, so mounting *is* the
+     * turn-end signal. The freshness window then separates "this Turn just ended"
+     * from "this Turn was restored from history", so opening a Session never
+     * re-collapses a disclosure the user had chosen to expand.
+     */
+    function ThoughtCollapse(props) {
+      const anchorRef = React.useRef(null);
+      const turn = props === null || props === undefined ? null : props.turn;
+
+      /** Wall-clock end of the Turn, when the shipped Turn object carries one. */
+      let endedAt = null;
+      if (turn !== null && typeof turn === 'object' && turn.end !== null && typeof turn.end === 'object') {
+        const time = turn.end.time;
+        if (typeof time === 'number' && Number.isFinite(time)) endedAt = time;
+      }
+
+      React.useEffect(() => {
+        if (endedAt === null) return undefined;
+        if (Date.now() - endedAt > FRESH_MS) return undefined;
+
+        let cancelled = false;
+        const timers = [];
+        const run = () => {
+          if (cancelled) return;
+          const anchor = anchorRef.current;
+          if (anchor === null || anchor === undefined) return;
+          const turnNumber = readTurnNumber(anchor);
+          if (turnNumber === null) return;
+          const scope = resolveScope(anchor);
+          if (scope === null) return;
+          foldTurn(turnNumber, scope);
+        };
+
+        if (typeof window === 'undefined' || typeof window.setTimeout !== 'function') {
+          run();
           return undefined;
         }
+        for (let index = 0; index < PASS_DELAYS.length; index += 1) {
+          timers.push(window.setTimeout(run, PASS_DELAYS[index]));
+        }
         return () => {
-          if (frame !== 0) window.cancelAnimationFrame(frame);
-          observer.disconnect();
+          cancelled = true;
+          for (let index = 0; index < timers.length; index += 1) window.clearTimeout(timers[index]);
         };
-      }, [read]);
+      }, [endedAt]);
 
-      /* Default folded, and a finished Turn folds itself once. */
-      React.useEffect(() => {
-        if (!closed) return undefined;
-        const timer = window.setTimeout(() => {
-          const turnNumber = readTurnNumber(anchorRef.current);
-          if (turnNumber === null) return;
-          const key = autoFoldKey(sessionId, turnNumber);
-          if (AUTO_FOLDED.has(key)) return;
-          AUTO_FOLDED.add(key);
-          if (AUTO_FOLDED.size > AUTO_FOLDED_LIMIT) {
-            const oldest = AUTO_FOLDED.values().next();
-            if (!oldest.done) AUTO_FOLDED.delete(oldest.value);
-          }
-          apply('collapse');
-        }, 0);
-        return () => window.clearTimeout(timer);
-      }, [closed, sessionId, apply]);
-
-      const anchor = h('span', { className: 'dtc-anchor', ref: anchorRef, 'aria-hidden': true });
-
-      if (!closed) return anchor;
-
-      const empty = view.total === 0;
-      const label = empty
-        ? t('bar.empty')
-        : view.open > 0
-          ? formatCount(t, view.open)
-          : t('bar.collapsed');
-
-      return h(
-        React.Fragment,
-        null,
-        anchor,
-        h(
-          'div',
-          { className: 'dtc-bar', 'data-open': view.open > 0 ? true : undefined },
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'dtc-toggle',
-              disabled: empty,
-              title: view.open > 0 ? t('bar.collapse') : t('bar.expand'),
-              'aria-label': view.open > 0 ? t('bar.collapse') : t('bar.expand'),
-              'aria-expanded': view.open > 0,
-              onClick: toggle,
-            },
-            h('span', { className: 'dtc-title' }, t('bar.title')),
-            h('span', { className: 'dtc-meta' }, label),
-            chevron(),
-          ),
-        ),
-      );
+      return h('span', { className: 'dtc-anchor', ref: anchorRef, 'aria-hidden': true });
     }
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots'],
       apply(ctx) {
-        ctx.effect(() => ctx.locale.register(NS, DICTS), 'thought-collapse: locale');
         ctx.effect(() => attachStyles(CSS), 'thought-collapse: styles');
         ctx.slots.inject(SLOT, () => ctx.slots.register(
-          { name: SLOT, id: ID, order: ORDER, locale: NS },
-          ThoughtCollapseBar,
+          { name: SLOT, id: ID, order: ORDER },
+          ThoughtCollapse,
         ));
       },
     };
